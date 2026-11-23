@@ -1,0 +1,187 @@
+# Sistem EHR & Antrean Real-Time (Polyglot NoSQL)
+#   MongoDB : replica set rs0, 3 node (mongo1 primary utama, mongo2 & mongo3 secondary)
+#   Redis   : Redis Cluster 6 node (3 master + 3 replica), 16384 hash slot
+#   app     : container untuk menjalankan menu demo
+#   worker  : penghubung event Redis Stream -> MongoDB
+#
+# Jalankan : docker compose up -d --build
+# Demo     : docker compose exec app python demo.py
+# Hapus    : docker compose down -v
+
+name: ehr-nosql
+
+x-mongo: &mongo
+  image: mongo:8.0
+  command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+  healthcheck:
+    test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+    interval: 5s
+    timeout: 5s
+    retries: 30
+  networks: [ehrnet]
+
+x-redis: &redis
+  image: redis:7.4
+  command:
+    - redis-server
+    - --cluster-enabled
+    - "yes"
+    - --cluster-config-file
+    - nodes.conf
+    - --cluster-node-timeout
+    - "5000"
+    - --appendonly
+    - "yes"
+    - --appendfsync
+    - everysec
+    - --maxmemory
+    - 128mb
+    - --maxmemory-policy
+    - noeviction
+    - --protected-mode
+    - "no"
+  healthcheck:
+    test: ["CMD", "redis-cli", "ping"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+
+x-app-env: &app-env
+  MONGO_URI: mongodb://mongo1:27017,mongo2:27017,mongo3:27017/?replicaSet=rs0
+  REDIS_NODES: 10.250.0.21:6379,10.250.0.22:6379,10.250.0.23:6379
+  REDIS_NAMES: 10.250.0.21:6379=redis-1,10.250.0.22:6379=redis-2,10.250.0.23:6379=redis-3,10.250.0.24:6379=redis-4,10.250.0.25:6379=redis-5,10.250.0.26:6379=redis-6
+
+services:
+  # ------------------------------------------------------------ MongoDB
+  mongo1:
+    <<: *mongo
+    container_name: mongo1
+    hostname: mongo1
+    ports: ["27017:27017"]
+  mongo2:
+    <<: *mongo
+    container_name: mongo2
+    hostname: mongo2
+    ports: ["27018:27017"]
+  mongo3:
+    <<: *mongo
+    container_name: mongo3
+    hostname: mongo3
+    ports: ["27019:27017"]
+
+  # ------------------------------------------------------------ Redis Cluster
+  # IP dibuat tetap supaya node tetap saling kenal setelah di-restart
+  redis-1:
+    <<: *redis
+    container_name: redis-1
+    networks: {ehrnet: {ipv4_address: 10.250.0.21}}
+  redis-2:
+    <<: *redis
+    container_name: redis-2
+    networks: {ehrnet: {ipv4_address: 10.250.0.22}}
+  redis-3:
+    <<: *redis
+    container_name: redis-3
+    networks: {ehrnet: {ipv4_address: 10.250.0.23}}
+  redis-4:
+    <<: *redis
+    container_name: redis-4
+    networks: {ehrnet: {ipv4_address: 10.250.0.24}}
+  redis-5:
+    <<: *redis
+    container_name: redis-5
+    networks: {ehrnet: {ipv4_address: 10.250.0.25}}
+  redis-6:
+    <<: *redis
+    container_name: redis-6
+    networks: {ehrnet: {ipv4_address: 10.250.0.26}}
+
+  # ------------------------------------------------------------ inisialisasi (sekali jalan)
+  mongo-init:
+    image: mongo:8.0
+    container_name: mongo-init
+    networks: [ehrnet]
+    depends_on:
+      mongo1: {condition: service_healthy}
+      mongo2: {condition: service_healthy}
+      mongo3: {condition: service_healthy}
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        mongosh --host mongo1 --quiet --eval '
+          try {
+            rs.status();
+            print("Replica set rs0 sudah ada");
+          } catch (e) {
+            rs.initiate({_id: "rs0", members: [
+              {_id: 0, host: "mongo1:27017", priority: 2},
+              {_id: 1, host: "mongo2:27017", priority: 1},
+              {_id: 2, host: "mongo3:27017", priority: 1}
+            ]});
+            print("Replica set rs0 dibuat");
+          }'
+        until mongosh --host mongo1 --quiet --eval 'db.hello().isWritablePrimary' | grep -q true; do
+          echo "menunggu primary terpilih..."; sleep 2;
+        done
+        echo "MongoDB siap"
+
+  redis-init:
+    image: redis:7.4
+    container_name: redis-init
+    networks: [ehrnet]
+    depends_on:
+      redis-1: {condition: service_healthy}
+      redis-2: {condition: service_healthy}
+      redis-3: {condition: service_healthy}
+      redis-4: {condition: service_healthy}
+      redis-5: {condition: service_healthy}
+      redis-6: {condition: service_healthy}
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        if redis-cli -h 10.250.0.21 cluster info | grep -q "cluster_state:ok"; then
+          echo "Redis Cluster sudah ada"
+        else
+          redis-cli --cluster create \
+            10.250.0.21:6379 10.250.0.22:6379 10.250.0.23:6379 \
+            10.250.0.24:6379 10.250.0.25:6379 10.250.0.26:6379 \
+            --cluster-replicas 1 --cluster-yes
+        fi
+        until redis-cli -h 10.250.0.21 cluster info | grep -q "cluster_state:ok"; do sleep 1; done
+        echo "Redis Cluster siap"
+
+  # ------------------------------------------------------------ aplikasi
+  app:
+    build: ./app
+    container_name: ehr-app
+    networks: [ehrnet]
+    environment: *app-env
+    volumes: ["./app:/app"]
+    depends_on:
+      mongo-init: {condition: service_completed_successfully}
+      redis-init: {condition: service_completed_successfully}
+    command: ["bash", "-c", "python setup_db.py && touch /tmp/ready && tail -f /dev/null"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 3s
+      retries: 60
+    stdin_open: true
+    tty: true
+
+  worker:
+    build: ./app
+    container_name: ehr-worker
+    networks: [ehrnet]
+    environment: *app-env
+    volumes: ["./app:/app"]
+    depends_on:
+      app: {condition: service_healthy}
+    command: ["python", "-u", "worker.py"]
+    restart: unless-stopped
+
+networks:
+  ehrnet:
+    ipam:
+      config:
+        - subnet: 10.250.0.0/24
+          ip_range: 10.250.0.128/25   # IP otomatis diambil dari .128 ke atas, tidak bentrok dengan Redis
